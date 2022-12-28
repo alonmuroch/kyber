@@ -1,8 +1,11 @@
 package dkg
 
 import (
+	"encoding/hex"
 	"errors"
 	"fmt"
+	bls "github.com/drand/kyber-bls12381"
+	bls2 "github.com/herumi/bls-eth-go-binary/bls"
 	"math/rand"
 	"testing"
 
@@ -125,12 +128,43 @@ func testResults(t *testing.T, suite Suite, thr, n int, results []*Result) {
 		pubShare := exp.Eval(share.I)
 		expShare := suite.Point().Mul(share.V, nil)
 		require.True(t, pubShare.V.Equal(expShare), "share %s give pub %s vs exp %s", share.V.String(), pubShare.V.String(), expShare.String())
+
+		_ = bls2.Init(bls2.BLS12_381)
+		_ = bls2.SetETHmode(bls2.EthModeDraft07)
+
+		fmt.Printf("id %d\n", share.I)
+		bytssk, _ := share.V.MarshalBinary()
+		sk := &bls2.SecretKey{}
+		require.NoError(t, sk.Deserialize(bytssk))
+		fmt.Printf("sk: %s\n", hex.EncodeToString(sk.Serialize()))
+
+		byts, _ := pubShare.V.MarshalBinary()
+		fmt.Printf("pubshare: %x\n", byts)
+		pk := &bls2.PublicKey{}
+		require.NoError(t, pk.Deserialize(byts))
+		fmt.Printf("pk hex: %s\n", pk.GetHexString())
+
+		fmt.Printf("pk serialize: %x\n\n\n", pk.Serialize())
+
+		//sk := &bls2.SecretKey{}
+		//sk.Deserialize(bytssk)
+		//fmt.Printf("\n\n%s\n\n\n", sk.GetHexString())
 	}
 
 	secretPoly, err := share.RecoverPriPoly(suite, shares, thr, n)
 	require.NoError(t, err)
 	gotPub := secretPoly.Commit(suite.Point().Base())
 	require.True(t, exp.Equal(gotPub))
+	bytssk, _ := secretPoly.Eval(0).V.MarshalBinary()
+
+	sk := bls2.SecretKey{}
+	require.NoError(t, sk.Deserialize(bytssk))
+	fmt.Printf("val sk: %s\n", hex.EncodeToString(sk.Serialize()))
+
+	pubShare, _ := exp.Eval(secretPoly.Eval(0).I).V.MarshalBinary()
+	pk := &bls2.PublicKey{}
+	require.NoError(t, pk.Deserialize(pubShare))
+	fmt.Printf("val pk hex: %x\n", pk.Serialize())
 
 	secret, err := share.RecoverSecret(suite, shares, thr, n)
 	require.NoError(t, err)
@@ -366,8 +400,9 @@ func TestDKGSkipIndex(t *testing.T) {
 }
 func TestDKGFull(t *testing.T) {
 	n := 5
-	thr := n
-	suite := edwards25519.NewBlakeSHA256Ed25519()
+	thr := 3
+	//suite := edwards25519.NewBlakeSHA256Ed25519()
+	suite := bls.NewBLS12381Suite().G1().(Suite)
 	tns := GenerateTestNodes(suite, n)
 	list := NodesFromTest(tns)
 	conf := Config{
