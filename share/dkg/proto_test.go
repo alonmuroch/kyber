@@ -1,7 +1,12 @@
 package dkg
 
 import (
+	"crypto/rsa"
+	"crypto/sha256"
+	"encoding/json"
 	"fmt"
+	bls "github.com/drand/kyber-bls12381"
+	bls2 "github.com/drand/kyber/sign/bls"
 	"testing"
 	"time"
 
@@ -146,22 +151,85 @@ func moveTime(tns []*TestNode, p time.Duration) {
 }
 
 func TestProtoFull(t *testing.T) {
-	n := 5
-	thr := n
+
+	initMsg := &SignedInit{
+		Message: Init{
+			Operators:             []uint64{1, 2, 3, 4},
+			T:                     3,
+			Nonce:                 1,
+			WithdrawalCredentials: []byte("0x010000000000000000000000506dcf70bea0c0b96039ede2e0429cc1795ffe67"), // taken from https://beaconcha.in/validator/612290#deposits
+		},
+		Address:   [20]byte{},
+		Signature: []byte{},
+	}
+
+	/*
+		public data
+	*/
+	n := len(initMsg.Message.Operators)
+	thr := initMsg.Message.T
+	suite := bls.NewBLS12381Suite()
+	g1Suite := suite.G1().(Suite)
+	dbOperatorKeys := map[uint64]*rsa.PrivateKey{ // populated with hardcoded for testing, should be taken from ssv contracts
+		1: {},
+		2: {},
+		3: {},
+		4: {},
+	}
 	period := 1 * time.Second
-	suite := edwards25519.NewBlakeSHA256Ed25519()
-	tns := GenerateTestNodes(suite, n)
-	list := NodesFromTest(tns)
-	network := NewTestNetwork(n)
+	network := NewTestNetwork(n + 1)
+	tns := make([]*TestNode, 0) // local test node
+
+	/**
+	Pre phase
+	*/
+	exchMsgs := make([]*SignedInitExchange, 0)
+	for i, id := range initMsg.Message.Operators {
+		// happens for each node locally
+		require.NoError(t, ValidateInitMessage(initMsg))
+		tns = append(tns, NewTestNode(g1Suite, int(id)))
+
+		m := &SignedInitExchange{
+			Node: Node{
+				Index:  Index(id),
+				Public: tns[i].Public,
+			},
+			Signer: id,
+		}
+		byts, err := json.Marshal(m) // replace with ssz
+		require.NoError(t, err)
+		r := sha256.Sum256(byts)
+		sig, err := SignRSA(dbOperatorKeys[id], r)
+		require.NoError(t, err)
+		m.Signature = sig
+		exchMsgs = append(exchMsgs, m)
+	}
+
+	// upon all SignedInitExchange received (done by every node)
+	list := make([]Node, 0)
+	for _, msg := range exchMsgs {
+		signerID := msg.Signer
+		pk := dbOperatorKeys[signerID].PublicKey
+		byts, err := json.Marshal(msg.Node)
+		require.NoError(t, err)
+		require.NoError(t, VerifyRSA(&pk, msg.Signature, byts))
+
+		list = append(list, msg.Node)
+	}
+
+	// done by every node
 	dkgConf := Config{
-		Suite:     suite,
+		Suite:     g1Suite,
 		NewNodes:  list,
-		Threshold: thr,
-		Auth:      schnorr.NewScheme(suite),
+		Threshold: int(thr),
+		Auth:      bls2.NewSchemeOnG2(suite),
 	}
 	SetupNodes(tns, &dkgConf)
 	SetupProto(tns, &dkgConf, period, network)
 
+	/*
+		main drand look for every node
+	*/
 	var resCh = make(chan OptionResult, 1)
 	// start all nodes and wait until each end
 	for _, node := range tns {
@@ -192,8 +260,65 @@ func TestProtoFull(t *testing.T) {
 			break
 		}
 	}
-	testResults(t, suite, thr, n, results)
+	testResults(t, g1Suite, int(thr), n, results)
 
+	/*
+		post drand
+	*/
+	outputs := make([]*SignedOutput, 0)
+	for _, res := range results {
+		id := uint64(res.Key.Share.I)
+
+		share, err := ResultToShareSecretKey(res)
+		require.NoError(t, err)
+
+		validatorPK, err := ResultsToValidatorPK(res.Key.Commitments(), g1Suite)
+		require.NoError(t, err)
+
+		encryptedShare, err := Encrypt(&dbOperatorKeys[id].PublicKey, share.Serialize())
+		require.NoError(t, err)
+
+		root, _, err := GenerateETHDepositData(
+			validatorPK.Serialize(),
+			initMsg.Message.WithdrawalCredentials,
+			initMsg.Message.Fork,
+		)
+		partialDepositSig := share.SignByte(root)
+
+		output := Output{
+			Nonce:                       initMsg.Message.Nonce,
+			EncryptedShare:              encryptedShare,
+			SharePK:                     share.GetPublicKey().Serialize(),
+			ValidatorPK:                 validatorPK.Serialize(),
+			DepositDataPartialSignature: partialDepositSig.Serialize(),
+		}
+		byts, err := json.Marshal(output) // replace with ssz
+		require.NoError(t, err)
+		r := sha256.Sum256(byts)
+		sig, err := SignRSA(dbOperatorKeys[id], r)
+		signedOutput := &SignedOutput{
+			Message:   output,
+			Signer:    id,
+			Signature: sig,
+		}
+		outputs = append(outputs, signedOutput)
+	}
+
+	/*
+		verified by DKG requester
+	*/
+	var validatorPK []byte
+	for i, output := range outputs {
+		byts, err := json.Marshal(output.Message) // replace with ssz
+		require.NoError(t, err)
+		require.NoError(t, VerifyRSA(&dbOperatorKeys[output.Signer].PublicKey, output.Signature, byts))
+
+		if i == 0 {
+			validatorPK = output.Message.ValidatorPK
+		} else {
+			require.EqualValues(t, validatorPK, output.Message.ValidatorPK)
+		}
+	}
 }
 
 func TestProtoResharing(t *testing.T) {

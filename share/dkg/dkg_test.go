@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	bls "github.com/drand/kyber-bls12381"
+	bls3 "github.com/drand/kyber/sign/bls"
 	bls2 "github.com/herumi/bls-eth-go-binary/bls"
 	"math/rand"
 	"testing"
@@ -409,7 +410,7 @@ func TestDKGFull(t *testing.T) {
 		Suite:     suite,
 		NewNodes:  list,
 		Threshold: thr,
-		Auth:      schnorr.NewScheme(suite),
+		Auth:      bls3.NewSchemeOnG1(bls.NewBLS12381Suite()),
 	}
 
 	results := RunDKG(t, tns, conf, nil, nil, nil)
